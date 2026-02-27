@@ -64,12 +64,14 @@ When the bot is online and `DISCORD_CLIENT_ID` + `GUILD_ID` are valid, slash com
 | `CHANNEL_ID` | Yes | Target Discord channel ID for embeds | `123456789012345678` |
 | `DISCORD_CLIENT_ID` | Yes | Discord application client ID (for slash command registration) | `123456789012345678` |
 | `GUILD_ID` | Yes | Discord server ID where slash commands are registered | `123456789012345678` |
+| `TRACKED_WALLETS` | No | Comma-separated wallet addresses to classify BUY/SELL direction | `0xabc...,0xdef...` |
 | `TX_EVENT_FILTERS` | No | Comma-separated event types to send | `mint,sweep,buy,sell` |
 | `PORT` | No | HTTP server port for webhook receiver | `3000` |
 
 Notes:
 
 - `TX_EVENT_FILTERS` valid values: `mint`, `sweep`, `buy`, `sell`.
+- `TRACKED_WALLETS` is optional but recommended in production so BUY/SELL classification is consistent.
 - Invalid or empty filter values fall back to default: `mint,sweep,buy,sell`.
 - Restart the process after changing environment variables.
 
@@ -167,6 +169,7 @@ pm2 install pm2-logrotate
 - **Webhook requests received but no output**
   - Confirm payload uses Alchemy `event.activity`.
   - Check whether events are filtered out by `TX_EVENT_FILTERS`.
+  - Ensure target wallets are configured in `TRACKED_WALLETS` or via `/wallet-label add`, otherwise BUY/SELL can be skipped as unknown.
 
 ## Security
 

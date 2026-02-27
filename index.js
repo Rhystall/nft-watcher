@@ -9,7 +9,8 @@ const {
     REST,
     Routes,
     SlashCommandBuilder,
-    PermissionFlagsBits
+    PermissionFlagsBits,
+    MessageFlags
 } = require('discord.js');
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -27,6 +28,7 @@ app.use(express.json());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const enabledEventFilters = parseEventFilters(process.env.TX_EVENT_FILTERS);
+const configuredTrackedWallets = parseAddressList(process.env.TRACKED_WALLETS);
 
 ensureLabelStorage();
 
@@ -90,7 +92,7 @@ client.on('interactionCreate', async (interaction) => {
         if (!interaction.inGuild()) {
             await interaction.reply({
                 content: 'Command ini hanya bisa digunakan di server (guild).',
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
             return;
         }
@@ -98,7 +100,7 @@ client.on('interactionCreate', async (interaction) => {
         if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
             await interaction.reply({
                 content: 'Kamu tidak punya izin untuk mengelola label wallet.',
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
             return;
         }
@@ -120,7 +122,7 @@ client.on('interactionCreate', async (interaction) => {
             if (!isValidAddress(normalizedAddress)) {
                 await interaction.reply({
                     content: 'Alamat wallet tidak valid. Gunakan format 0x + 40 karakter hex.',
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
                 return;
             }
@@ -128,7 +130,7 @@ client.on('interactionCreate', async (interaction) => {
             if (!ownerInput) {
                 await interaction.reply({
                     content: 'Nama owner tidak boleh kosong.',
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
                 return;
             }
@@ -138,7 +140,7 @@ client.on('interactionCreate', async (interaction) => {
 
             await interaction.reply({
                 content: `Label disimpan: \`${shortAddress(normalizedAddress)}\` -> **${escapeMarkdown(ownerInput)}**`,
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
             return;
         }
@@ -150,7 +152,7 @@ client.on('interactionCreate', async (interaction) => {
             if (!isValidAddress(normalizedAddress)) {
                 await interaction.reply({
                     content: 'Alamat wallet tidak valid. Gunakan format 0x + 40 karakter hex.',
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
                 return;
             }
@@ -158,7 +160,7 @@ client.on('interactionCreate', async (interaction) => {
             if (!guildLabels[normalizedAddress]) {
                 await interaction.reply({
                     content: `Label untuk \`${shortAddress(normalizedAddress)}\` tidak ditemukan.`,
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
                 return;
             }
@@ -168,7 +170,7 @@ client.on('interactionCreate', async (interaction) => {
 
             await interaction.reply({
                 content: `Label untuk \`${shortAddress(normalizedAddress)}\` berhasil dihapus.`,
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
             return;
         }
@@ -178,7 +180,7 @@ client.on('interactionCreate', async (interaction) => {
             if (entries.length === 0) {
                 await interaction.reply({
                     content: 'Belum ada label wallet untuk guild ini.',
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
                 return;
             }
@@ -191,7 +193,7 @@ client.on('interactionCreate', async (interaction) => {
 
             await interaction.reply({
                 content: `Daftar label wallet (${entries.length}):\n${lines.join('\n')}${remain}`,
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
         }
     } catch (error) {
@@ -200,14 +202,14 @@ client.on('interactionCreate', async (interaction) => {
         if (!interaction.replied && !interaction.deferred) {
             await interaction.reply({
                 content: 'Terjadi error saat memproses command.',
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
             return;
         }
 
         await interaction.followUp({
             content: 'Terjadi error saat memproses command.',
-            ephemeral: true
+            flags: MessageFlags.Ephemeral
         });
     }
 });
@@ -215,6 +217,7 @@ client.on('interactionCreate', async (interaction) => {
 app.post('/webhook/nft', async (req, res) => {
     try {
         const data = req.body;
+        const webhookId = data?.id || data?.webhookId || data?.event?.webhookId || 'unknown';
         const activities = Array.isArray(data?.event?.activity) ? data.event.activity : [];
 
         if (activities.length === 0) {
@@ -236,20 +239,53 @@ app.post('/webhook/nft', async (req, res) => {
         }
 
         const guildLabels = getGuildLabels(channel.guildId);
-        const events = buildEventsFromActivities(normalizedActivities, guildLabels);
+        const trackedWallets = buildTrackedWallets(guildLabels);
+        const { events, unknownCount } = buildEventsFromActivities(normalizedActivities, trackedWallets);
+
+        if (events.length === 0) {
+            if (unknownCount > 0) {
+                console.log(
+                    `[WEBHOOK] id=${webhookId} aktivitas di-skip karena belum cocok tracked wallet. unknown=${unknownCount}, tracked=${trackedWallets.size}`
+                );
+            }
+            return res.status(200).send('Tidak ada event yang cocok untuk dikirim');
+        }
 
         let sentCount = 0;
+        let skippedByFilter = 0;
+        let failedCount = 0;
         for (const event of events) {
             if (!enabledEventFilters.has(event.type)) {
+                skippedByFilter += 1;
                 continue;
             }
 
             const embed = buildEmbed(event, guildLabels);
-            await channel.send({ embeds: [embed] });
-            sentCount += 1;
+            try {
+                await channel.send({ embeds: [embed] });
+                sentCount += 1;
+            } catch (error) {
+                failedCount += 1;
+                console.error(
+                    `Gagal mengirim embed Discord. type=${event.type}, hash=${event.hash || 'N/A'}`,
+                    error
+                );
+            }
         }
 
-        res.status(200).send(`Webhook berhasil diproses (${sentCount} notifikasi)`);
+        console.log(
+            `[WEBHOOK] id=${webhookId} incoming=${activities.length}, normalized=${normalizedActivities.length}, built=${events.length}, sent=${sentCount}, failed=${failedCount}, filtered=${skippedByFilter}, unknown=${unknownCount}, tracked=${trackedWallets.size}`
+        );
+
+        if (trackedWallets.size === 0 && unknownCount > 0) {
+            console.warn(
+                'TRACKED_WALLETS dan wallet label masih kosong. Event BUY/SELL bisa gagal terklasifikasi. Isi TRACKED_WALLETS di .env atau tambah label via /wallet-label.'
+            );
+        }
+
+        res.status(200).send(
+            `Webhook berhasil diproses (sent=${sentCount}, failed=${failedCount}, filtered=${skippedByFilter})`
+        );
     } catch (error) {
         console.error('Error memproses webhook Alchemy:', error);
         res.status(500).send('Internal Server Error');
@@ -260,6 +296,13 @@ app.post('/webhook/nft', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server Webhook berjalan di http://localhost:${PORT}`);
+    console.log(`⚙️ Filter event aktif: ${[...enabledEventFilters].join(', ')}`);
+    console.log(`👀 Tracked wallet dari env: ${configuredTrackedWallets.size}`);
+    if (configuredTrackedWallets.size === 0) {
+        console.warn(
+            'TRACKED_WALLETS kosong. BUY/SELL akan mengandalkan wallet label dan fallback heuristik dari payload webhook.'
+        );
+    }
     client.login(process.env.DISCORD_TOKEN);
 });
 
@@ -274,6 +317,44 @@ function parseEventFilters(rawValue) {
         .filter((entry) => VALID_EVENT_TYPES.has(entry));
 
     return parsed.length > 0 ? new Set(parsed) : new Set(DEFAULT_EVENT_FILTERS);
+}
+
+function parseAddressList(rawValue) {
+    if (typeof rawValue !== 'string' || rawValue.trim() === '') {
+        return new Set();
+    }
+
+    const parsed = new Set();
+    const tokens = rawValue.split(/[,\s]+/).map((entry) => normalizeAddress(entry));
+
+    for (const token of tokens) {
+        if (!token) {
+            continue;
+        }
+
+        if (!isValidAddress(token)) {
+            console.warn(`Alamat di TRACKED_WALLETS tidak valid dan di-skip: ${token}`);
+            continue;
+        }
+
+        parsed.add(token);
+    }
+
+    return parsed;
+}
+
+function buildTrackedWallets(guildLabels) {
+    const tracked = new Set(configuredTrackedWallets);
+
+    for (const address of Object.keys(guildLabels || {})) {
+        const normalizedAddress = normalizeAddress(address);
+        if (!isValidAddress(normalizedAddress)) {
+            continue;
+        }
+        tracked.add(normalizedAddress);
+    }
+
+    return tracked;
 }
 
 function ensureLabelStorage() {
@@ -345,10 +426,11 @@ function normalizeActivity(activity, index) {
     };
 }
 
-function buildEventsFromActivities(activities, guildLabels) {
+function buildEventsFromActivities(activities, trackedWallets) {
     const events = [];
     const consumedActivityIds = new Set();
     const sweepBuckets = new Map();
+    let unknownCount = 0;
 
     for (const activity of activities) {
         if (!activity.hash || !activity.toAddress) {
@@ -361,6 +443,14 @@ function buildEventsFromActivities(activities, guildLabels) {
         }
 
         const normalizedTo = normalizeAddress(activity.toAddress);
+        if (!normalizedTo) {
+            continue;
+        }
+
+        if (trackedWallets.size > 0 && !trackedWallets.has(normalizedTo)) {
+            continue;
+        }
+
         const key = `${activity.hash}:${normalizedTo}`;
         if (!sweepBuckets.has(key)) {
             sweepBuckets.set(key, []);
@@ -397,8 +487,9 @@ function buildEventsFromActivities(activities, guildLabels) {
             continue;
         }
 
-        const type = classifySingleActivity(activity, guildLabels);
+        const type = classifySingleActivity(activity, trackedWallets);
         if (type === 'unknown') {
+            unknownCount += 1;
             continue;
         }
 
@@ -412,23 +503,43 @@ function buildEventsFromActivities(activities, guildLabels) {
         });
     }
 
-    return events;
+    return { events, unknownCount };
 }
 
-function classifySingleActivity(activity, guildLabels) {
+function classifySingleActivity(activity, trackedWallets) {
     const normalizedFrom = normalizeAddress(activity.fromAddress);
     const normalizedTo = normalizeAddress(activity.toAddress);
+    const hasTrackedWallets = trackedWallets.size > 0;
+    const isFromTracked = normalizedFrom ? trackedWallets.has(normalizedFrom) : false;
+    const isToTracked = normalizedTo ? trackedWallets.has(normalizedTo) : false;
 
     if (normalizedFrom === ZERO_ADDRESS) {
-        return 'mint';
+        if (!hasTrackedWallets || isToTracked) {
+            return 'mint';
+        }
+        return 'unknown';
     }
 
-    if (normalizedTo && guildLabels[normalizedTo]) {
+    if (isToTracked && !isFromTracked) {
         return 'buy';
     }
 
-    if (normalizedFrom && guildLabels[normalizedFrom]) {
+    if (isFromTracked && !isToTracked) {
         return 'sell';
+    }
+
+    if (isFromTracked && isToTracked) {
+        return 'buy';
+    }
+
+    if (!hasTrackedWallets) {
+        if (normalizedTo) {
+            return 'buy';
+        }
+
+        if (normalizedFrom) {
+            return 'sell';
+        }
     }
 
     return 'unknown';
