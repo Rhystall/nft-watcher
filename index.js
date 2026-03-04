@@ -14,13 +14,15 @@ const {
 } = require('discord.js');
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
-const TRACKED_CATEGORIES = new Set(['erc721', 'erc1155']);
-const VALID_EVENT_TYPES = new Set(['mint', 'sweep', 'buy', 'sell']);
-const DEFAULT_EVENT_FILTERS = ['mint', 'sweep', 'buy', 'sell'];
+const NFT_CATEGORIES = new Set(['erc721', 'erc1155']);
+const NFT_TOKEN_TYPES = new Set(['erc721', 'erc1155']);
+const VALID_EVENT_TYPES = new Set(['mint', 'sweep', 'buy', 'sell', 'transfer']);
+const DEFAULT_EVENT_FILTERS = ['mint', 'sweep', 'buy', 'sell', 'transfer'];
 const MAX_SWEEP_TOKEN_PREVIEW = 10;
 const ETHERSCAN_ADDRESS_URL = 'https://etherscan.io/address';
 const WEBHOOK_PATH = '/webhook/nft';
 const WEBHOOK_BODY_LIMIT = process.env.WEBHOOK_BODY_LIMIT || '20mb';
+const WEBHOOK_DEBUG_SKIPS = parseBooleanEnv(process.env.WEBHOOK_DEBUG_SKIPS, false);
 
 const dataDir = path.join(__dirname, 'data');
 const walletLabelsPath = path.join(dataDir, 'wallet-labels.json');
@@ -233,53 +235,76 @@ app.post(WEBHOOK_PATH, webhookJsonParser, async (req, res) => {
 
         const guildLabels = getGuildLabels(channel.guildId);
         const trackedWallets = buildTrackedWallets(guildLabels);
+        const incomingCount = activities.length;
+        let nftAccepted = 0;
+        let nftRejected = 0;
+        const normalizedActivities = [];
 
-        const normalizedActivities = activities
-            .filter((activity) => isNFTActivity(activity))
-            .map((activity, index) => {
-                const normalized = normalizeActivity(activity, index);
-                if (!normalized) {
-                    return null;
-                }
+        for (const [index, activity] of activities.entries()) {
+            const support = isSupportedNFTActivity(activity);
+            if (!support.supported) {
+                nftRejected += 1;
+                logWebhookSkip({ reason: support.reason, activity });
+                continue;
+            }
 
-                return {
-                    ...normalized,
-                    transactionHash: activity.transactionHash || activity.hash || normalized.hash || null,
-                    tokenIds: extractTokenIds(activity)
-                };
-            })
-            .filter(Boolean);
+            const normalized = normalizeActivity(activity, index);
+            if (!normalized) {
+                nftRejected += 1;
+                logWebhookSkip({ reason: 'normalize_failed', activity });
+                continue;
+            }
+
+            normalizedActivities.push({
+                ...normalized,
+                transactionHash: activity.transactionHash || activity.hash || normalized.hash || null,
+                tokenIds: extractTokenIds(activity)
+            });
+            nftAccepted += 1;
+        }
 
         if (normalizedActivities.length === 0) {
+            console.log(
+                `[WEBHOOK] Summary incoming=${incomingCount}, nftAccepted=${nftAccepted}, nftRejected=${nftRejected}, tx=0, transfer=0, filtered=0, sent=0, failed=0, tracked=${trackedWallets.size}`
+            );
             return res.status(200).send('ok');
         }
 
         // One notification per transaction hash to avoid sweep spam.
         const groupedActivities = groupByTxHash(normalizedActivities);
+        let classifiedTransfer = 0;
+        let filteredByEnv = 0;
         let sentCount = 0;
         let failedCount = 0;
-        let skippedByFilter = 0;
-        let skippedByClassification = 0;
+        let droppedNoEvent = 0;
 
         for (const [txHash, txActivities] of groupedActivities.entries()) {
             // Classify at transaction level so conduit/proxy transfers are still captured.
             const classification = classifyTransaction(txActivities, trackedWallets);
-            const { eventType, nftCount } = classification;
-            console.log(`[WEBHOOK] Processing tx ${txHash} → ${eventType} (${nftCount} NFTs)`);
-
-            if (eventType === 'UNKNOWN' || eventType === 'INTERNAL_TRANSFER') {
-                skippedByClassification += 1;
-                continue;
+            const { eventType, nftCount, rawEventType } = classification;
+            if (eventType === 'TRANSFER') {
+                classifiedTransfer += 1;
             }
+            const logEventType = rawEventType && rawEventType !== eventType
+                ? `${eventType} (${rawEventType})`
+                : eventType;
+            console.log(`[WEBHOOK] Processing tx ${txHash} → ${logEventType} (${nftCount} NFTs)`);
 
             const event = buildEventFromTransaction(txHash, txActivities, classification, trackedWallets);
             if (!event) {
-                skippedByClassification += 1;
+                droppedNoEvent += 1;
+                logWebhookSkip({ reason: 'event_build_failed', activity: txActivities[0], txHash });
                 continue;
             }
 
             if (!enabledEventFilters.has(event.type)) {
-                skippedByFilter += 1;
+                filteredByEnv += 1;
+                logWebhookSkip({
+                    reason: 'filtered_by_env',
+                    activity: txActivities[0],
+                    txHash,
+                    eventType: event.type
+                });
                 continue;
             }
 
@@ -294,7 +319,7 @@ app.post(WEBHOOK_PATH, webhookJsonParser, async (req, res) => {
         }
 
         console.log(
-            `[WEBHOOK] Summary tx=${groupedActivities.size}, sent=${sentCount}, failed=${failedCount}, filtered=${skippedByFilter}, skipped=${skippedByClassification}, tracked=${trackedWallets.size}`
+            `[WEBHOOK] Summary incoming=${incomingCount}, nftAccepted=${nftAccepted}, nftRejected=${nftRejected}, tx=${groupedActivities.size}, transfer=${classifiedTransfer}, filtered=${filteredByEnv}, sent=${sentCount}, failed=${failedCount}, dropped=${droppedNoEvent}, tracked=${trackedWallets.size}`
         );
     } catch (error) {
         console.error('[WEBHOOK] Error memproses webhook Alchemy:', error);
@@ -325,11 +350,12 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server Webhook berjalan di http://localhost:${PORT}`);
     console.log(`📦 WEBHOOK_BODY_LIMIT aktif: ${WEBHOOK_BODY_LIMIT}`);
+    console.log(`🧪 WEBHOOK_DEBUG_SKIPS: ${WEBHOOK_DEBUG_SKIPS}`);
     console.log(`⚙️ Filter event aktif: ${[...enabledEventFilters].join(', ')}`);
     console.log(`👀 Tracked wallet dari env: ${configuredTrackedWallets.size}`);
     if (configuredTrackedWallets.size === 0) {
         console.warn(
-            'TRACKED_WALLETS kosong. BUY/SELL akan mengandalkan wallet label dan fallback heuristik dari payload webhook.'
+            'TRACKED_WALLETS kosong. BUY/SELL/SWEEP akan mengandalkan wallet label, dan event ambigu dipetakan ke TRANSFER.'
         );
     }
     client.login(process.env.DISCORD_TOKEN);
@@ -346,6 +372,22 @@ function parseEventFilters(rawValue) {
         .filter((entry) => VALID_EVENT_TYPES.has(entry));
 
     return parsed.length > 0 ? new Set(parsed) : new Set(DEFAULT_EVENT_FILTERS);
+}
+
+function parseBooleanEnv(rawValue, defaultValue = false) {
+    if (typeof rawValue !== 'string') {
+        return defaultValue;
+    }
+
+    const normalized = rawValue.trim().toLowerCase();
+    if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) {
+        return true;
+    }
+    if (['false', '0', 'no', 'n', 'off'].includes(normalized)) {
+        return false;
+    }
+
+    return defaultValue;
 }
 
 function parseAddressList(rawValue) {
@@ -438,28 +480,51 @@ function getGuildLabels(guildId) {
 }
 
 function normalizeActivity(activity, index) {
-    const category = (activity?.category || '').toLowerCase();
-    if (!activity || !TRACKED_CATEGORIES.has(category)) {
+    if (!activity) {
         return null;
     }
 
-    const tokenId = activity.erc721TokenId || activity.erc1155Metadata?.[0]?.tokenId || 'N/A';
+    const category = normalizeCategory(activity.category);
+    const tokenIds = extractTokenIds(activity);
+    const tokenId = tokenIds[0] || 'N/A';
 
     return {
         id: `${index}-${activity.hash || activity.transactionHash || 'nohash'}`,
         hash: activity.hash || activity.transactionHash || null,
+        rawCategory: activity.category || null,
         category,
-        contractAddress: activity.rawContract?.address || null,
+        tokenType: normalizeTokenType(activity.tokenType) || null,
+        contractAddress: activity.rawContract?.address || activity.contractAddress || null,
         tokenId: String(tokenId),
         fromAddress: activity.fromAddress || null,
         toAddress: activity.toAddress || null
     };
 }
 
-function isNFTActivity(act) {
-    const cat = (act?.category || '').toLowerCase();
-    return (cat === 'erc721' || cat === 'erc1155') &&
-        (act?.erc721TokenId || (Array.isArray(act?.erc1155Metadata) && act.erc1155Metadata.length > 0));
+function isSupportedNFTActivity(activity) {
+    if (!activity) {
+        return { supported: false, reason: 'missing_activity' };
+    }
+
+    const category = normalizeCategory(activity.category);
+    const tokenType = normalizeTokenType(activity.tokenType);
+    const hasERC721TokenId = activity?.erc721TokenId !== undefined && activity?.erc721TokenId !== null;
+    const hasERC1155Metadata = Array.isArray(activity?.erc1155Metadata) &&
+        activity.erc1155Metadata.some((metadata) => metadata?.tokenId !== undefined && metadata?.tokenId !== null);
+    const hasNFTEvidence = hasERC721TokenId || hasERC1155Metadata || NFT_TOKEN_TYPES.has(tokenType);
+
+    if (NFT_CATEGORIES.has(category)) {
+        return { supported: true, reason: 'accepted_nft_category' };
+    }
+
+    if (category === 'token') {
+        if (hasNFTEvidence) {
+            return { supported: true, reason: 'accepted_token_with_nft_evidence' };
+        }
+        return { supported: false, reason: 'token_without_nft_evidence' };
+    }
+
+    return { supported: false, reason: `unsupported_category:${category || 'unknown'}` };
 }
 
 function extractTokenIds(act) {
@@ -467,6 +532,13 @@ function extractTokenIds(act) {
 
     if (act?.erc721TokenId !== undefined && act?.erc721TokenId !== null) {
         const tokenId = String(act.erc721TokenId).trim();
+        if (tokenId) {
+            tokenIdSet.add(tokenId);
+        }
+    }
+
+    if (act?.tokenId !== undefined && act?.tokenId !== null) {
+        const tokenId = String(act.tokenId).trim();
         if (tokenId) {
             tokenIdSet.add(tokenId);
         }
@@ -485,6 +557,35 @@ function extractTokenIds(act) {
     }
 
     return [...tokenIdSet];
+}
+
+function normalizeCategory(category) {
+    if (typeof category !== 'string') {
+        return '';
+    }
+    return category.trim().toLowerCase();
+}
+
+function normalizeTokenType(tokenType) {
+    if (typeof tokenType !== 'string') {
+        return '';
+    }
+    return tokenType.trim().toLowerCase();
+}
+
+function logWebhookSkip({ reason, activity = null, txHash = null, eventType = null }) {
+    if (!WEBHOOK_DEBUG_SKIPS) {
+        return;
+    }
+
+    const category = normalizeCategory(activity?.category) || 'unknown';
+    const tokenType = normalizeTokenType(activity?.tokenType) || 'unknown';
+    const resolvedTxHash = txHash || activity?.transactionHash || activity?.hash || 'nohash';
+    const eventTypeSuffix = eventType ? `, eventType=${eventType}` : '';
+
+    console.log(
+        `[WEBHOOK][SKIP] reason=${reason}, tx=${resolvedTxHash}, category=${category}, tokenType=${tokenType}${eventTypeSuffix}`
+    );
 }
 
 function groupByTxHash(activities) {
@@ -534,29 +635,29 @@ function classifyTransaction(txActivities, trackedWallets) {
 
     // Mint takes precedence over trade direction.
     if (hasMint) {
-        return { eventType: 'MINT', nftCount, isSweep: false };
+        return { eventType: 'MINT', rawEventType: 'MINT', nftCount, isSweep: false };
     }
 
     if (nftCount > 1) {
         if (hasTrackedFrom && hasTrackedTo) {
-            return { eventType: 'INTERNAL_TRANSFER', nftCount, isSweep: true };
+            return { eventType: 'TRANSFER', rawEventType: 'INTERNAL_TRANSFER', nftCount, isSweep: false };
         }
         if (hasTrackedTo) {
-            return { eventType: 'SWEEP_BUY', nftCount, isSweep: true };
+            return { eventType: 'SWEEP_BUY', rawEventType: 'SWEEP_BUY', nftCount, isSweep: true };
         }
         if (hasTrackedFrom) {
-            return { eventType: 'SWEEP_SELL', nftCount, isSweep: true };
+            return { eventType: 'SWEEP_SELL', rawEventType: 'SWEEP_SELL', nftCount, isSweep: true };
         }
     }
 
     if (hasTrackedTo) {
-        return { eventType: 'BUY', nftCount, isSweep: false };
+        return { eventType: 'BUY', rawEventType: 'BUY', nftCount, isSweep: false };
     }
     if (hasTrackedFrom) {
-        return { eventType: 'SELL', nftCount, isSweep: false };
+        return { eventType: 'SELL', rawEventType: 'SELL', nftCount, isSweep: false };
     }
 
-    return { eventType: 'UNKNOWN', nftCount, isSweep: false };
+    return { eventType: 'TRANSFER', rawEventType: 'TRANSFER_FALLBACK', nftCount, isSweep: false };
 }
 
 function buildEventFromTransaction(txHash, txActivities, classification, trackedWallets) {
@@ -565,9 +666,7 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
     }
 
     const eventType = classification.eventType;
-    if (eventType === 'UNKNOWN' || eventType === 'INTERNAL_TRANSFER') {
-        return null;
-    }
+    const rawEventType = classification.rawEventType || eventType;
 
     let primaryTrackedWallet = null;
 
@@ -594,7 +693,8 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
         BUY: 'buy',
         SELL: 'sell',
         SWEEP_BUY: 'sweep',
-        SWEEP_SELL: 'sweep'
+        SWEEP_SELL: 'sweep',
+        TRANSFER: 'transfer'
     }[eventType];
 
     if (!mappedType) {
@@ -639,7 +739,7 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
 
         return {
             type: 'sweep',
-            rawEventType: eventType,
+            rawEventType,
             hash: txHash,
             toAddress,
             fromAddresses: [...fromAddressSet],
@@ -692,7 +792,7 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
 
     return {
         type: mappedType,
-        rawEventType: eventType,
+        rawEventType,
         hash: txHash,
         contractAddress: representative.contractAddress || null,
         tokenId: representativeTokenId ? String(representativeTokenId) : 'N/A',

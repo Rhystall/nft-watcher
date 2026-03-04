@@ -13,7 +13,7 @@ It receives Alchemy Custom Webhook payloads, classifies events heuristically, an
 
 ## Features
 
-- **Heuristic Event Classification**: Detects and classifies events into `MINT`, `BUY`, `SELL`, and `SWEEP`.
+- **Heuristic Event Classification**: Detects and classifies events into `MINT`, `BUY`, `SELL`, `SWEEP`, and fallback `TRANSFER`.
 - **Anti-Spam Sweep Deduplication**: Multiple NFTs swept in the same transaction context are summarized into a single embed.
 - **In-Discord Wallet Labeling**: Manage labels directly from Discord with `/wallet-label add`, `/wallet-label remove`, and `/wallet-label list`.
 - **Admin-Only Wallet Label Commands**: Slash commands require the `ManageGuild` permission.
@@ -65,15 +65,19 @@ When the bot is online and `DISCORD_CLIENT_ID` + `GUILD_ID` are valid, slash com
 | `DISCORD_CLIENT_ID` | Yes | Discord application client ID (for slash command registration) | `123456789012345678` |
 | `GUILD_ID` | Yes | Discord server ID where slash commands are registered | `123456789012345678` |
 | `TRACKED_WALLETS` | No | Comma-separated wallet addresses to classify BUY/SELL direction | `0xabc...,0xdef...` |
-| `TX_EVENT_FILTERS` | No | Comma-separated event types to send | `mint,sweep,buy,sell` |
+| `TX_EVENT_FILTERS` | No | Comma-separated event types to send | `mint,sweep,buy,sell,transfer` |
 | `PORT` | No | HTTP server port for webhook receiver | `3000` |
 | `WEBHOOK_BODY_LIMIT` | No | Max JSON payload size for `/webhook/nft` | `20mb` |
+| `WEBHOOK_DEBUG_SKIPS` | No | Enable debug logs for skipped/filtered webhook activities | `false` |
 
 Notes:
 
-- `TX_EVENT_FILTERS` valid values: `mint`, `sweep`, `buy`, `sell`.
+- `TX_EVENT_FILTERS` valid values: `mint`, `sweep`, `buy`, `sell`, `transfer`.
 - `TRACKED_WALLETS` is optional but recommended in production so BUY/SELL classification is consistent.
-- Invalid or empty filter values fall back to default: `mint,sweep,buy,sell`.
+- Invalid or empty filter values fall back to default: `mint,sweep,buy,sell,transfer`.
+- For Alchemy `Address Activity`, payload `category: token` is treated as NFT only when NFT evidence exists (`erc721TokenId`, `erc1155Metadata`, or `tokenType` = `ERC721/ERC1155`).
+- Ambiguous NFT direction (cannot infer BUY/SELL safely) is mapped to `TRANSFER` instead of being dropped.
+- Set `WEBHOOK_DEBUG_SKIPS=true` temporarily for detailed skip reasons (`reason`, `category`, `tokenType`, `txHash`).
 - If webhook payload size exceeds `WEBHOOK_BODY_LIMIT`, endpoint returns HTTP `413` with `{ "error": "payload_too_large" }`.
 - Restart the process after changing environment variables.
 
@@ -108,7 +112,7 @@ Notes:
 Behavior summary:
 
 - Non-NFT activities are ignored.
-- Unknown or non-matching events are skipped.
+- Non-NFT or unsupported payload patterns are skipped.
 - Events not included in `TX_EVENT_FILTERS` are not sent.
 
 ## Deployment (PM2)
