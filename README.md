@@ -67,12 +67,14 @@ When the bot is online and `DISCORD_CLIENT_ID` + `GUILD_ID` are valid, slash com
 | `TRACKED_WALLETS` | No | Comma-separated wallet addresses to classify BUY/SELL direction | `0xabc...,0xdef...` |
 | `TX_EVENT_FILTERS` | No | Comma-separated event types to send | `mint,sweep,buy,sell` |
 | `PORT` | No | HTTP server port for webhook receiver | `3000` |
+| `WEBHOOK_BODY_LIMIT` | No | Max JSON payload size for `/webhook/nft` | `20mb` |
 
 Notes:
 
 - `TX_EVENT_FILTERS` valid values: `mint`, `sweep`, `buy`, `sell`.
 - `TRACKED_WALLETS` is optional but recommended in production so BUY/SELL classification is consistent.
 - Invalid or empty filter values fall back to default: `mint,sweep,buy,sell`.
+- If webhook payload size exceeds `WEBHOOK_BODY_LIMIT`, endpoint returns HTTP `413` with `{ "error": "payload_too_large" }`.
 - Restart the process after changing environment variables.
 
 ## Usage
@@ -147,6 +149,7 @@ Common PM2 operations:
 pm2 status
 pm2 logs nft-watcher-bot
 pm2 restart nft-watcher-bot
+pm2 restart nft-watcher-bot --update-env
 pm2 stop nft-watcher-bot
 pm2 delete nft-watcher-bot
 ```

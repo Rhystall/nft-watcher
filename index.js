@@ -19,12 +19,14 @@ const VALID_EVENT_TYPES = new Set(['mint', 'sweep', 'buy', 'sell']);
 const DEFAULT_EVENT_FILTERS = ['mint', 'sweep', 'buy', 'sell'];
 const MAX_SWEEP_TOKEN_PREVIEW = 10;
 const ETHERSCAN_ADDRESS_URL = 'https://etherscan.io/address';
+const WEBHOOK_PATH = '/webhook/nft';
+const WEBHOOK_BODY_LIMIT = process.env.WEBHOOK_BODY_LIMIT || '20mb';
 
 const dataDir = path.join(__dirname, 'data');
 const walletLabelsPath = path.join(dataDir, 'wallet-labels.json');
 
 const app = express();
-app.use(express.json());
+const webhookJsonParser = express.json({ limit: WEBHOOK_BODY_LIMIT });
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const enabledEventFilters = parseEventFilters(process.env.TX_EVENT_FILTERS);
@@ -214,7 +216,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 });
 
-app.post('/webhook/nft', async (req, res) => {
+app.post(WEBHOOK_PATH, webhookJsonParser, async (req, res) => {
     try {
         const activities = Array.isArray(req.body?.event?.activity) ? req.body.event.activity : [];
         console.log(`[WEBHOOK] Received ${activities.length} activities`);
@@ -303,10 +305,26 @@ app.post('/webhook/nft', async (req, res) => {
     }
 });
 
+app.use((error, req, res, next) => {
+    const isWebhookRequest = req.path === WEBHOOK_PATH;
+    const isPayloadTooLarge = error?.type === 'entity.too.large' || error?.status === 413;
+
+    if (isWebhookRequest && isPayloadTooLarge) {
+        const length = req.headers['content-length'] || 'unknown';
+        console.warn(
+            `[WEBHOOK] Payload terlalu besar. content-length=${length}, limit=${WEBHOOK_BODY_LIMIT}, status=413`
+        );
+        return res.status(413).json({ error: 'payload_too_large' });
+    }
+
+    return next(error);
+});
+
 // Jalankan Express Server & Login Bot
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server Webhook berjalan di http://localhost:${PORT}`);
+    console.log(`📦 WEBHOOK_BODY_LIMIT aktif: ${WEBHOOK_BODY_LIMIT}`);
     console.log(`⚙️ Filter event aktif: ${[...enabledEventFilters].join(', ')}`);
     console.log(`👀 Tracked wallet dari env: ${configuredTrackedWallets.size}`);
     if (configuredTrackedWallets.size === 0) {
