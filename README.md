@@ -15,6 +15,7 @@ It receives Alchemy Custom Webhook payloads, classifies events heuristically, an
 
 - **Heuristic Event Classification**: Detects and classifies events into `MINT`, `BUY`, `SELL`, `SWEEP`, and fallback `TRANSFER`.
 - **Anti-Spam Sweep Deduplication**: Multiple NFTs swept in the same transaction context are summarized into a single embed.
+- **OpenSea Collection Links**: Contract links in embeds point to OpenSea collection pages (with automatic fallback URL).
 - **In-Discord Wallet Labeling**: Manage labels directly from Discord with `/wallet-label add`, `/wallet-label remove`, and `/wallet-label list`.
 - **Admin-Only Wallet Label Commands**: Slash commands require the `ManageGuild` permission.
 - **Global Event Filters**: Control which event types are sent via `TX_EVENT_FILTERS` in `.env`.
@@ -69,6 +70,9 @@ When the bot is online and `DISCORD_CLIENT_ID` + `GUILD_ID` are valid, slash com
 | `PORT` | No | HTTP server port for webhook receiver | `3000` |
 | `WEBHOOK_BODY_LIMIT` | No | Max JSON payload size for `/webhook/nft` | `20mb` |
 | `WEBHOOK_DEBUG_SKIPS` | No | Enable debug logs for skipped/filtered webhook activities | `false` |
+| `OPENSEA_API_KEY` | No | OpenSea API key for contract -> collection slug lookup | `os_...` |
+| `OPENSEA_LOOKUP_TIMEOUT_MS` | No | Timeout for OpenSea lookup requests in ms | `2500` |
+| `OPENSEA_SLUG_CACHE_TTL_SECONDS` | No | Cache TTL for resolved contract links | `86400` |
 
 Notes:
 
@@ -77,7 +81,10 @@ Notes:
 - Invalid or empty filter values fall back to default: `mint,sweep,buy,sell,transfer`.
 - For Alchemy `Address Activity`, payload `category: token` is treated as NFT only when NFT evidence exists (`erc721TokenId`, `erc1155Metadata`, or `tokenType` = `ERC721/ERC1155`).
 - Ambiguous NFT direction (cannot infer BUY/SELL safely) is mapped to `TRANSFER` instead of being dropped.
+- Bulk sell from tracked wallet (`nftCount > 1` and wallet on `from`) is classified as `SELL`, not `SWEEP`.
 - Set `WEBHOOK_DEBUG_SKIPS=true` temporarily for detailed skip reasons (`reason`, `category`, `tokenType`, `txHash`).
+- Contract links (`Koleksi (Contract)`) use OpenSea collection URL (`/collection/{slug}`), then fallback to OpenSea asset URL (`/assets/ethereum/{contract}`) when slug lookup fails.
+- Wallet links (`Dari`/`Ke`) remain Etherscan links.
 - If webhook payload size exceeds `WEBHOOK_BODY_LIMIT`, endpoint returns HTTP `413` with `{ "error": "payload_too_large" }`.
 - Restart the process after changing environment variables.
 
@@ -114,6 +121,7 @@ Behavior summary:
 - Non-NFT activities are ignored.
 - Non-NFT or unsupported payload patterns are skipped.
 - Events not included in `TX_EVENT_FILTERS` are not sent.
+- Bulk sell transactions from tracked wallets are emitted as `SELL` (with token summary), not `SWEEP`.
 
 ## Deployment (PM2)
 

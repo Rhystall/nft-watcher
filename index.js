@@ -20,12 +20,20 @@ const VALID_EVENT_TYPES = new Set(['mint', 'sweep', 'buy', 'sell', 'transfer']);
 const DEFAULT_EVENT_FILTERS = ['mint', 'sweep', 'buy', 'sell', 'transfer'];
 const MAX_SWEEP_TOKEN_PREVIEW = 10;
 const ETHERSCAN_ADDRESS_URL = 'https://etherscan.io/address';
+const OPENSEA_COLLECTION_URL = 'https://opensea.io/collection';
+const OPENSEA_ASSET_URL = 'https://opensea.io/assets/ethereum';
+const OPENSEA_CONTRACT_API_URL = 'https://api.opensea.io/api/v2/chain/ethereum/contract';
 const WEBHOOK_PATH = '/webhook/nft';
 const WEBHOOK_BODY_LIMIT = process.env.WEBHOOK_BODY_LIMIT || '20mb';
 const WEBHOOK_DEBUG_SKIPS = parseBooleanEnv(process.env.WEBHOOK_DEBUG_SKIPS, false);
+const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY || '';
+const OPENSEA_LOOKUP_TIMEOUT_MS = parsePositiveIntEnv(process.env.OPENSEA_LOOKUP_TIMEOUT_MS, 2500);
+const OPENSEA_SLUG_CACHE_TTL_SECONDS = parsePositiveIntEnv(process.env.OPENSEA_SLUG_CACHE_TTL_SECONDS, 86400);
+const OPENSEA_SLUG_CACHE_TTL_MS = OPENSEA_SLUG_CACHE_TTL_SECONDS * 1000;
 
 const dataDir = path.join(__dirname, 'data');
 const walletLabelsPath = path.join(dataDir, 'wallet-labels.json');
+const openSeaCollectionUrlCache = new Map();
 
 const app = express();
 const webhookJsonParser = express.json({ limit: WEBHOOK_BODY_LIMIT });
@@ -308,8 +316,8 @@ app.post(WEBHOOK_PATH, webhookJsonParser, async (req, res) => {
                 continue;
             }
 
-            const embed = buildEmbed(event, guildLabels);
             try {
+                const embed = await buildEmbed(event, guildLabels);
                 await channel.send({ embeds: [embed] });
                 sentCount += 1;
             } catch (error) {
@@ -351,6 +359,7 @@ app.listen(PORT, () => {
     console.log(`🚀 Server Webhook berjalan di http://localhost:${PORT}`);
     console.log(`📦 WEBHOOK_BODY_LIMIT aktif: ${WEBHOOK_BODY_LIMIT}`);
     console.log(`🧪 WEBHOOK_DEBUG_SKIPS: ${WEBHOOK_DEBUG_SKIPS}`);
+    console.log(`🖼️ OpenSea lookup timeout=${OPENSEA_LOOKUP_TIMEOUT_MS}ms cacheTtl=${OPENSEA_SLUG_CACHE_TTL_SECONDS}s`);
     console.log(`⚙️ Filter event aktif: ${[...enabledEventFilters].join(', ')}`);
     console.log(`👀 Tracked wallet dari env: ${configuredTrackedWallets.size}`);
     if (configuredTrackedWallets.size === 0) {
@@ -385,6 +394,15 @@ function parseBooleanEnv(rawValue, defaultValue = false) {
     }
     if (['false', '0', 'no', 'n', 'off'].includes(normalized)) {
         return false;
+    }
+
+    return defaultValue;
+}
+
+function parsePositiveIntEnv(rawValue, defaultValue) {
+    const parsed = Number.parseInt(rawValue, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
     }
 
     return defaultValue;
@@ -642,11 +660,11 @@ function classifyTransaction(txActivities, trackedWallets) {
         if (hasTrackedFrom && hasTrackedTo) {
             return { eventType: 'TRANSFER', rawEventType: 'INTERNAL_TRANSFER', nftCount, isSweep: false };
         }
-        if (hasTrackedTo) {
+        if (hasTrackedTo && !hasTrackedFrom) {
             return { eventType: 'SWEEP_BUY', rawEventType: 'SWEEP_BUY', nftCount, isSweep: true };
         }
-        if (hasTrackedFrom) {
-            return { eventType: 'SWEEP_SELL', rawEventType: 'SWEEP_SELL', nftCount, isSweep: true };
+        if (hasTrackedFrom && !hasTrackedTo) {
+            return { eventType: 'SELL', rawEventType: 'BULK_SELL', nftCount, isSweep: false };
         }
     }
 
@@ -667,6 +685,8 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
 
     const eventType = classification.eventType;
     const rawEventType = classification.rawEventType || eventType;
+    const tokenIds = collectTokenIdsFromActivities(txActivities);
+    const isBulkSell = eventType === 'SELL' && (rawEventType === 'BULK_SELL' || classification.nftCount > 1);
 
     let primaryTrackedWallet = null;
 
@@ -693,7 +713,6 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
         BUY: 'buy',
         SELL: 'sell',
         SWEEP_BUY: 'sweep',
-        SWEEP_SELL: 'sweep',
         TRANSFER: 'transfer'
     }[eventType];
 
@@ -705,7 +724,6 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
         // Aggregate sweep payload into a single embed-compatible event.
         const contractSet = new Set();
         const fromAddressSet = new Set();
-        const tokenIdSet = new Set();
         let toAddress = null;
 
         for (const activity of txActivities) {
@@ -720,12 +738,6 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
                 toAddress = activity.toAddress;
             }
 
-            const activityTokenIds = Array.isArray(activity.tokenIds) && activity.tokenIds.length > 0
-                ? activity.tokenIds
-                : [activity.tokenId].filter(Boolean);
-            for (const tokenId of activityTokenIds) {
-                tokenIdSet.add(String(tokenId));
-            }
         }
 
         if (primaryTrackedWallet && eventType === 'SWEEP_BUY') {
@@ -744,7 +756,7 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
             toAddress,
             fromAddresses: [...fromAddressSet],
             contracts: [...contractSet],
-            tokenIds: [...tokenIdSet],
+            tokenIds,
             nftCount: classification.nftCount,
             isSweep: Boolean(classification.isSweep),
             sweepType: eventType === 'SWEEP_BUY' ? 'buy' : 'sell',
@@ -786,9 +798,10 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
         return null;
     }
 
-    const representativeTokenId = Array.isArray(representative.tokenIds) && representative.tokenIds.length > 0
-        ? representative.tokenIds[0]
-        : representative.tokenId;
+    const representativeTokenId = tokenIds[0] ||
+        (Array.isArray(representative.tokenIds) && representative.tokenIds.length > 0
+            ? representative.tokenIds[0]
+            : representative.tokenId);
 
     return {
         type: mappedType,
@@ -796,16 +809,37 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
         hash: txHash,
         contractAddress: representative.contractAddress || null,
         tokenId: representativeTokenId ? String(representativeTokenId) : 'N/A',
+        tokenIds,
         fromAddress: representative.fromAddress || null,
         toAddress: representative.toAddress || null,
         nftCount: classification.nftCount,
+        isBulk: isBulkSell,
         isSweep: Boolean(classification.isSweep),
         sweepType: null,
         primaryTrackedWallet
     };
 }
 
-function buildEmbed(event, guildLabels) {
+function collectTokenIdsFromActivities(txActivities) {
+    const tokenIdSet = new Set();
+
+    for (const activity of txActivities) {
+        const activityTokenIds = Array.isArray(activity?.tokenIds) && activity.tokenIds.length > 0
+            ? activity.tokenIds
+            : [activity?.tokenId].filter(Boolean);
+
+        for (const tokenId of activityTokenIds) {
+            const normalizedTokenId = String(tokenId).trim();
+            if (normalizedTokenId) {
+                tokenIdSet.add(normalizedTokenId);
+            }
+        }
+    }
+
+    return [...tokenIdSet];
+}
+
+async function buildEmbed(event, guildLabels) {
     const typeLabel = event.type.toUpperCase();
 
     const embed = new EmbedBuilder()
@@ -815,8 +849,9 @@ function buildEmbed(event, guildLabels) {
         .setFooter({ text: 'Trace NFT Watcher • Powered by Alchemy' });
 
     if (event.type === 'sweep') {
+        const contractValue = await formatSweepContracts(event.contracts);
         embed.addFields(
-            { name: 'Koleksi (Contract)', value: formatSweepContracts(event.contracts), inline: false },
+            { name: 'Koleksi (Contract)', value: contractValue, inline: false },
             { name: 'Tipe', value: typeLabel, inline: true },
             { name: 'Jumlah NFT', value: String(event.nftCount), inline: true },
             { name: 'Token Ringkasan', value: formatTokenSummary(event.tokenIds), inline: false },
@@ -826,8 +861,21 @@ function buildEmbed(event, guildLabels) {
         return embed;
     }
 
+    const contractValue = await formatContract(event.contractAddress);
+    if (event.type === 'sell' && event.isBulk) {
+        embed.addFields(
+            { name: 'Koleksi (Contract)', value: contractValue, inline: false },
+            { name: 'Tipe', value: typeLabel, inline: true },
+            { name: 'Jumlah NFT', value: String(event.nftCount), inline: true },
+            { name: 'Token Ringkasan', value: formatTokenSummary(event.tokenIds), inline: false },
+            { name: 'Dari', value: formatWallet(event.fromAddress, guildLabels), inline: true },
+            { name: 'Ke (Target)', value: formatWallet(event.toAddress, guildLabels), inline: true }
+        );
+        return embed;
+    }
+
     embed.addFields(
-        { name: 'Koleksi (Contract)', value: formatContract(event.contractAddress), inline: false },
+        { name: 'Koleksi (Contract)', value: contractValue, inline: false },
         { name: 'Tipe', value: typeLabel, inline: true },
         { name: 'Token ID', value: escapeMarkdown(event.tokenId || 'N/A'), inline: true },
         { name: 'Dari', value: formatWallet(event.fromAddress, guildLabels), inline: true },
@@ -849,19 +897,19 @@ function formatSweepFrom(fromAddresses, guildLabels) {
     return `Multiple wallets (${fromAddresses.length})`;
 }
 
-function formatSweepContracts(contracts) {
+async function formatSweepContracts(contracts) {
     if (!Array.isArray(contracts) || contracts.length === 0) {
         return 'Unknown';
     }
 
     if (contracts.length === 1) {
-        return formatContract(contracts[0]);
+        return await formatContract(contracts[0]);
     }
 
-    const preview = contracts
-        .slice(0, 3)
-        .map((address) => formatContract(address))
-        .join(', ');
+    const formattedContracts = await Promise.all(
+        contracts.map((address) => formatContract(address))
+    );
+    const preview = formattedContracts.slice(0, 3).join(', ');
     const extra = contracts.length > 3 ? ` +${contracts.length - 3} lainnya` : '';
 
     return `${contracts.length} contracts (${preview}${extra})`;
@@ -882,7 +930,7 @@ function formatTokenSummary(tokenIds) {
     return `${preview} +${sanitized.length - MAX_SWEEP_TOKEN_PREVIEW} lainnya`;
 }
 
-function formatContract(contractAddress) {
+async function formatContract(contractAddress) {
     if (!contractAddress) {
         return 'Unknown';
     }
@@ -891,7 +939,121 @@ function formatContract(contractAddress) {
         return escapeMarkdown(contractAddress);
     }
 
-    return `[${shortAddress(contractAddress)}](${ETHERSCAN_ADDRESS_URL}/${contractAddress})`;
+    const openSeaUrl = await resolveOpenSeaCollectionUrl(contractAddress);
+    return `[${shortAddress(contractAddress)}](${openSeaUrl})`;
+}
+
+async function resolveOpenSeaCollectionUrl(contractAddress) {
+    const normalizedContract = normalizeAddress(contractAddress);
+    if (!normalizedContract) {
+        return getOpenSeaAssetUrl(contractAddress);
+    }
+
+    const now = Date.now();
+    const cached = openSeaCollectionUrlCache.get(normalizedContract);
+    if (cached && cached.expiresAt > now && typeof cached.url === 'string') {
+        return cached.url;
+    }
+
+    const fallbackUrl = getOpenSeaAssetUrl(contractAddress);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), OPENSEA_LOOKUP_TIMEOUT_MS);
+
+    try {
+        const headers = { accept: 'application/json' };
+        if (OPENSEA_API_KEY) {
+            headers['x-api-key'] = OPENSEA_API_KEY;
+        }
+
+        const response = await fetch(`${OPENSEA_CONTRACT_API_URL}/${normalizedContract}`, {
+            method: 'GET',
+            headers,
+            signal: controller.signal
+        });
+
+        if (!response.ok) {
+            logOpenSeaLookupDebug(`lookup_failed contract=${normalizedContract} status=${response.status}`);
+            setOpenSeaCollectionUrlCache(normalizedContract, fallbackUrl);
+            return fallbackUrl;
+        }
+
+        const payload = await response.json();
+        const slug = extractOpenSeaCollectionSlug(payload);
+        if (!slug) {
+            logOpenSeaLookupDebug(`slug_not_found contract=${normalizedContract}`);
+            setOpenSeaCollectionUrlCache(normalizedContract, fallbackUrl);
+            return fallbackUrl;
+        }
+
+        const collectionUrl = `${OPENSEA_COLLECTION_URL}/${encodeURIComponent(slug)}`;
+        setOpenSeaCollectionUrlCache(normalizedContract, collectionUrl);
+        return collectionUrl;
+    } catch (error) {
+        if (error?.name === 'AbortError') {
+            logOpenSeaLookupDebug(`lookup_timeout contract=${normalizedContract}`);
+        } else {
+            logOpenSeaLookupDebug(
+                `lookup_error contract=${normalizedContract} message=${error?.message || 'unknown'}`
+            );
+        }
+        setOpenSeaCollectionUrlCache(normalizedContract, fallbackUrl);
+        return fallbackUrl;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+function setOpenSeaCollectionUrlCache(contractAddress, url) {
+    openSeaCollectionUrlCache.set(contractAddress, {
+        url,
+        expiresAt: Date.now() + OPENSEA_SLUG_CACHE_TTL_MS
+    });
+}
+
+function extractOpenSeaCollectionSlug(payload) {
+    const candidates = [];
+    const collection = payload?.collection;
+    if (typeof collection === 'string') {
+        candidates.push(collection);
+    }
+    if (collection && typeof collection === 'object' && typeof collection.slug === 'string') {
+        candidates.push(collection.slug);
+    }
+    if (typeof payload?.collection_slug === 'string') {
+        candidates.push(payload.collection_slug);
+    }
+    if (Array.isArray(payload?.collections)) {
+        for (const entry of payload.collections) {
+            if (typeof entry === 'string') {
+                candidates.push(entry);
+                continue;
+            }
+            if (entry && typeof entry.slug === 'string') {
+                candidates.push(entry.slug);
+            }
+        }
+    }
+
+    for (const candidate of candidates) {
+        const slug = String(candidate).trim();
+        if (slug) {
+            return slug;
+        }
+    }
+
+    return null;
+}
+
+function getOpenSeaAssetUrl(contractAddress) {
+    return `${OPENSEA_ASSET_URL}/${contractAddress}`;
+}
+
+function logOpenSeaLookupDebug(message) {
+    if (!WEBHOOK_DEBUG_SKIPS) {
+        return;
+    }
+
+    console.log(`[WEBHOOK][OPENSEA] ${message}`);
 }
 
 function formatWallet(address, guildLabels) {
