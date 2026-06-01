@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
@@ -16,24 +16,31 @@ const {
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const NFT_CATEGORIES = new Set(['erc721', 'erc1155']);
 const NFT_TOKEN_TYPES = new Set(['erc721', 'erc1155']);
+const PAYMENT_CATEGORIES = new Set(['external', 'internal', 'erc20']);
+const PAYMENT_TOKEN_TYPES = new Set(['erc20']);
 const VALID_EVENT_TYPES = new Set(['mint', 'sweep', 'buy', 'sell', 'transfer']);
 const DEFAULT_EVENT_FILTERS = ['mint', 'sweep', 'buy', 'sell', 'transfer'];
 const MAX_SWEEP_TOKEN_PREVIEW = 10;
 const ETHERSCAN_ADDRESS_URL = 'https://etherscan.io/address';
+const ETHERSCAN_TX_URL = 'https://etherscan.io/tx';
 const OPENSEA_COLLECTION_URL = 'https://opensea.io/collection';
 const OPENSEA_ASSET_URL = 'https://opensea.io/assets/ethereum';
 const OPENSEA_CONTRACT_API_URL = 'https://api.opensea.io/api/v2/chain/ethereum/contract';
 const WEBHOOK_PATH = '/webhook/nft';
 const WEBHOOK_BODY_LIMIT = process.env.WEBHOOK_BODY_LIMIT || '20mb';
 const WEBHOOK_DEBUG_SKIPS = parseBooleanEnv(process.env.WEBHOOK_DEBUG_SKIPS, false);
+const TX_CONTEXT_DEBOUNCE_MS = parsePositiveIntEnv(process.env.TX_CONTEXT_DEBOUNCE_MS, 2000);
+const TX_CONTEXT_TTL_MS = parsePositiveIntEnv(process.env.TX_CONTEXT_TTL_MS, 120000);
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY || '';
 const OPENSEA_LOOKUP_TIMEOUT_MS = parsePositiveIntEnv(process.env.OPENSEA_LOOKUP_TIMEOUT_MS, 2500);
 const OPENSEA_SLUG_CACHE_TTL_SECONDS = parsePositiveIntEnv(process.env.OPENSEA_SLUG_CACHE_TTL_SECONDS, 86400);
 const OPENSEA_SLUG_CACHE_TTL_MS = OPENSEA_SLUG_CACHE_TTL_SECONDS * 1000;
+const PORT = process.env.PORT || 3000;
 
 const dataDir = path.join(__dirname, 'data');
 const walletLabelsPath = path.join(dataDir, 'wallet-labels.json');
 const openSeaCollectionUrlCache = new Map();
+const txContexts = new Map();
 
 const app = express();
 const webhookJsonParser = express.json({ limit: WEBHOOK_BODY_LIMIT });
@@ -41,8 +48,6 @@ const webhookJsonParser = express.json({ limit: WEBHOOK_BODY_LIMIT });
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const enabledEventFilters = parseEventFilters(process.env.TX_EVENT_FILTERS);
 const configuredTrackedWallets = parseAddressList(process.env.TRACKED_WALLETS);
-
-ensureLabelStorage();
 
 const walletLabelCommand = new SlashCommandBuilder()
     .setName('wallet-label')
@@ -235,99 +240,9 @@ app.post(WEBHOOK_PATH, webhookJsonParser, async (req, res) => {
             return res.status(200).send('ok');
         }
 
-        const channel = await client.channels.fetch(process.env.CHANNEL_ID);
-        if (!channel || typeof channel.send !== 'function') {
-            console.error('[WEBHOOK] Channel target tidak valid atau tidak bisa mengirim pesan.');
-            return res.status(200).send('ok');
-        }
-
-        const guildLabels = getGuildLabels(channel.guildId);
-        const trackedWallets = buildTrackedWallets(guildLabels);
-        const incomingCount = activities.length;
-        let nftAccepted = 0;
-        let nftRejected = 0;
-        const normalizedActivities = [];
-
-        for (const [index, activity] of activities.entries()) {
-            const support = isSupportedNFTActivity(activity);
-            if (!support.supported) {
-                nftRejected += 1;
-                logWebhookSkip({ reason: support.reason, activity });
-                continue;
-            }
-
-            const normalized = normalizeActivity(activity, index);
-            if (!normalized) {
-                nftRejected += 1;
-                logWebhookSkip({ reason: 'normalize_failed', activity });
-                continue;
-            }
-
-            normalizedActivities.push({
-                ...normalized,
-                transactionHash: activity.transactionHash || activity.hash || normalized.hash || null,
-                tokenIds: extractTokenIds(activity)
-            });
-            nftAccepted += 1;
-        }
-
-        if (normalizedActivities.length === 0) {
-            console.log(
-                `[WEBHOOK] Summary incoming=${incomingCount}, nftAccepted=${nftAccepted}, nftRejected=${nftRejected}, tx=0, transfer=0, filtered=0, sent=0, failed=0, tracked=${trackedWallets.size}`
-            );
-            return res.status(200).send('ok');
-        }
-
-        // One notification per transaction hash to avoid sweep spam.
-        const groupedActivities = groupByTxHash(normalizedActivities);
-        let classifiedTransfer = 0;
-        let filteredByEnv = 0;
-        let sentCount = 0;
-        let failedCount = 0;
-        let droppedNoEvent = 0;
-
-        for (const [txHash, txActivities] of groupedActivities.entries()) {
-            // Classify at transaction level so conduit/proxy transfers are still captured.
-            const classification = classifyTransaction(txActivities, trackedWallets);
-            const { eventType, nftCount, rawEventType } = classification;
-            if (eventType === 'TRANSFER') {
-                classifiedTransfer += 1;
-            }
-            const logEventType = rawEventType && rawEventType !== eventType
-                ? `${eventType} (${rawEventType})`
-                : eventType;
-            console.log(`[WEBHOOK] Processing tx ${txHash} → ${logEventType} (${nftCount} NFTs)`);
-
-            const event = buildEventFromTransaction(txHash, txActivities, classification, trackedWallets);
-            if (!event) {
-                droppedNoEvent += 1;
-                logWebhookSkip({ reason: 'event_build_failed', activity: txActivities[0], txHash });
-                continue;
-            }
-
-            if (!enabledEventFilters.has(event.type)) {
-                filteredByEnv += 1;
-                logWebhookSkip({
-                    reason: 'filtered_by_env',
-                    activity: txActivities[0],
-                    txHash,
-                    eventType: event.type
-                });
-                continue;
-            }
-
-            try {
-                const embed = await buildEmbed(event, guildLabels);
-                await channel.send({ embeds: [embed] });
-                sentCount += 1;
-            } catch (error) {
-                failedCount += 1;
-                console.error(`Gagal mengirim embed Discord. type=${event.type}, hash=${event.hash || 'N/A'}`, error);
-            }
-        }
-
+        const stats = enqueueWebhookActivities(activities);
         console.log(
-            `[WEBHOOK] Summary incoming=${incomingCount}, nftAccepted=${nftAccepted}, nftRejected=${nftRejected}, tx=${groupedActivities.size}, transfer=${classifiedTransfer}, filtered=${filteredByEnv}, sent=${sentCount}, failed=${failedCount}, dropped=${droppedNoEvent}, tracked=${trackedWallets.size}`
+            `[WEBHOOK] Queued incoming=${stats.incoming}, nftAccepted=${stats.nftAccepted}, paymentAccepted=${stats.paymentAccepted}, rejected=${stats.rejected}, txQueued=${stats.txQueued}, pending=${txContexts.size}`
         );
     } catch (error) {
         console.error('[WEBHOOK] Error memproses webhook Alchemy:', error);
@@ -353,22 +268,28 @@ app.use((error, req, res, next) => {
     return next(error);
 });
 
-// Jalankan Express Server & Login Bot
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Server Webhook berjalan di http://localhost:${PORT}`);
-    console.log(`📦 WEBHOOK_BODY_LIMIT aktif: ${WEBHOOK_BODY_LIMIT}`);
-    console.log(`🧪 WEBHOOK_DEBUG_SKIPS: ${WEBHOOK_DEBUG_SKIPS}`);
-    console.log(`🖼️ OpenSea lookup timeout=${OPENSEA_LOOKUP_TIMEOUT_MS}ms cacheTtl=${OPENSEA_SLUG_CACHE_TTL_SECONDS}s`);
-    console.log(`⚙️ Filter event aktif: ${[...enabledEventFilters].join(', ')}`);
-    console.log(`👀 Tracked wallet dari env: ${configuredTrackedWallets.size}`);
-    if (configuredTrackedWallets.size === 0) {
-        console.warn(
-            'TRACKED_WALLETS kosong. BUY/SELL/SWEEP akan mengandalkan wallet label, dan event ambigu dipetakan ke TRANSFER.'
-        );
-    }
-    client.login(process.env.DISCORD_TOKEN);
-});
+function startBot() {
+    ensureLabelStorage();
+
+    const cleanupInterval = setInterval(cleanupTxContexts, Math.min(TX_CONTEXT_TTL_MS, 60000));
+    cleanupInterval.unref?.();
+
+    app.listen(PORT, () => {
+        console.log(`🚀 Server Webhook berjalan di http://localhost:${PORT}`);
+        console.log(`📦 WEBHOOK_BODY_LIMIT aktif: ${WEBHOOK_BODY_LIMIT}`);
+        console.log(`🧪 WEBHOOK_DEBUG_SKIPS: ${WEBHOOK_DEBUG_SKIPS}`);
+        console.log(`⏱️ TX context debounce=${TX_CONTEXT_DEBOUNCE_MS}ms ttl=${TX_CONTEXT_TTL_MS}ms`);
+        console.log(`🖼️ OpenSea lookup timeout=${OPENSEA_LOOKUP_TIMEOUT_MS}ms cacheTtl=${OPENSEA_SLUG_CACHE_TTL_SECONDS}s`);
+        console.log(`⚙️ Filter event aktif: ${[...enabledEventFilters].join(', ')}`);
+        console.log(`👀 Tracked wallet dari env: ${configuredTrackedWallets.size}`);
+        if (configuredTrackedWallets.size === 0) {
+            console.warn(
+                'TRACKED_WALLETS kosong. BUY/SELL/SWEEP akan mengandalkan wallet label, dan event ambigu dipetakan ke TRANSFER.'
+            );
+        }
+        client.login(process.env.DISCORD_TOKEN);
+    });
+}
 
 function parseEventFilters(rawValue) {
     if (typeof rawValue !== 'string' || rawValue.trim() === '') {
@@ -446,6 +367,175 @@ function buildTrackedWallets(guildLabels) {
     return tracked;
 }
 
+function enqueueWebhookActivities(activities) {
+    const stats = {
+        incoming: Array.isArray(activities) ? activities.length : 0,
+        nftAccepted: 0,
+        paymentAccepted: 0,
+        rejected: 0,
+        txQueued: 0
+    };
+    const touchedTxHashes = new Set();
+
+    if (!Array.isArray(activities)) {
+        return stats;
+    }
+
+    for (const [index, activity] of activities.entries()) {
+        const txHash = getActivityTxHash(activity);
+        if (!txHash) {
+            stats.rejected += 1;
+            logWebhookSkip({ reason: 'missing_tx_hash', activity });
+            continue;
+        }
+
+        const nftSupport = isSupportedNFTActivity(activity);
+        if (nftSupport.supported) {
+            const normalized = normalizeActivity(activity, index);
+            if (!normalized) {
+                stats.rejected += 1;
+                logWebhookSkip({ reason: 'normalize_nft_failed', activity });
+                continue;
+            }
+
+            getOrCreateTxContext(txHash).nftActivities.push(normalized);
+            stats.nftAccepted += 1;
+            touchedTxHashes.add(txHash);
+            continue;
+        }
+
+        const paymentSupport = isSupportedPaymentActivity(activity);
+        if (paymentSupport.supported) {
+            const normalized = normalizePaymentActivity(activity, index);
+            if (!normalized) {
+                stats.rejected += 1;
+                logWebhookSkip({ reason: 'normalize_payment_failed', activity });
+                continue;
+            }
+
+            getOrCreateTxContext(txHash).paymentActivities.push(normalized);
+            stats.paymentAccepted += 1;
+            touchedTxHashes.add(txHash);
+            continue;
+        }
+
+        stats.rejected += 1;
+        logWebhookSkip({ reason: paymentSupport.reason || nftSupport.reason, activity });
+    }
+
+    for (const txHash of touchedTxHashes) {
+        const context = getOrCreateTxContext(txHash);
+        context.updatedAt = Date.now();
+
+        if (context.timer) {
+            clearTimeout(context.timer);
+        }
+
+        context.timer = setTimeout(() => {
+            processTxContext(txHash).catch((error) => {
+                console.error(`[WEBHOOK] Error memproses tx context ${txHash}:`, error);
+            });
+        }, TX_CONTEXT_DEBOUNCE_MS);
+        context.timer.unref?.();
+    }
+
+    stats.txQueued = touchedTxHashes.size;
+    return stats;
+}
+
+function getOrCreateTxContext(txHash) {
+    if (!txContexts.has(txHash)) {
+        txContexts.set(txHash, {
+            nftActivities: [],
+            paymentActivities: [],
+            timer: null,
+            createdAt: Date.now(),
+            updatedAt: Date.now()
+        });
+    }
+
+    return txContexts.get(txHash);
+}
+
+async function processTxContext(txHash) {
+    const context = txContexts.get(txHash);
+    if (!context) {
+        return;
+    }
+
+    context.timer = null;
+    if (context.nftActivities.length === 0) {
+        logWebhookSkip({ reason: 'payment_context_waiting_for_nft', txHash });
+        return;
+    }
+
+    let shouldDeleteContext = true;
+    try {
+        const channel = await client.channels.fetch(process.env.CHANNEL_ID);
+        if (!channel || typeof channel.send !== 'function') {
+            console.error('[WEBHOOK] Channel target tidak valid atau tidak bisa mengirim pesan.');
+            return;
+        }
+
+        const guildLabels = getGuildLabels(channel.guildId);
+        const trackedWallets = buildTrackedWallets(guildLabels);
+        const classification = classifyTransaction(
+            context.nftActivities,
+            trackedWallets,
+            context.paymentActivities
+        );
+        const { eventType, nftCount, rawEventType } = classification;
+        const logEventType = rawEventType && rawEventType !== eventType
+            ? `${eventType} (${rawEventType})`
+            : eventType;
+
+        console.log(
+            `[WEBHOOK] Processing tx ${txHash} → ${logEventType} (${nftCount} NFTs, ${classification.paymentEvidence.length} payments)`
+        );
+
+        const event = buildEventFromTransaction(txHash, context.nftActivities, classification, trackedWallets);
+        if (!event) {
+            logWebhookSkip({ reason: 'event_build_failed', activity: context.nftActivities[0], txHash });
+            return;
+        }
+
+        if (!enabledEventFilters.has(event.type)) {
+            logWebhookSkip({
+                reason: 'filtered_by_env',
+                activity: context.nftActivities[0],
+                txHash,
+                eventType: event.type
+            });
+            return;
+        }
+
+        const embed = await buildEmbed(event, guildLabels);
+        await channel.send({ embeds: [embed] });
+    } catch (error) {
+        shouldDeleteContext = false;
+        console.error(`Gagal mengirim embed Discord. tx=${txHash}`, error);
+    } finally {
+        if (shouldDeleteContext) {
+            txContexts.delete(txHash);
+        }
+    }
+}
+
+function cleanupTxContexts() {
+    const now = Date.now();
+    for (const [txHash, context] of txContexts.entries()) {
+        if (now - context.updatedAt < TX_CONTEXT_TTL_MS) {
+            continue;
+        }
+
+        if (context.timer) {
+            clearTimeout(context.timer);
+        }
+        txContexts.delete(txHash);
+        logWebhookSkip({ reason: 'tx_context_expired', txHash });
+    }
+}
+
 function ensureLabelStorage() {
     fs.mkdirSync(dataDir, { recursive: true });
 
@@ -503,17 +593,50 @@ function normalizeActivity(activity, index) {
     }
 
     const category = normalizeCategory(activity.category);
+    const txHash = getActivityTxHash(activity);
     const tokenIds = extractTokenIds(activity);
     const tokenId = tokenIds[0] || 'N/A';
 
     return {
-        id: `${index}-${activity.hash || activity.transactionHash || 'nohash'}`,
-        hash: activity.hash || activity.transactionHash || null,
+        id: `${index}-${txHash || 'nohash'}`,
+        kind: 'nft',
+        hash: txHash,
+        transactionHash: txHash,
         rawCategory: activity.category || null,
         category,
         tokenType: normalizeTokenType(activity.tokenType) || null,
         contractAddress: activity.rawContract?.address || activity.contractAddress || null,
         tokenId: String(tokenId),
+        tokenIds,
+        fromAddress: activity.fromAddress || null,
+        toAddress: activity.toAddress || null
+    };
+}
+
+function normalizePaymentActivity(activity, index) {
+    if (!activity) {
+        return null;
+    }
+
+    const txHash = getActivityTxHash(activity);
+    if (!txHash) {
+        return null;
+    }
+
+    const category = normalizeCategory(activity.category);
+    const contractAddress = activity.rawContract?.address || activity.contractAddress || null;
+
+    return {
+        id: `${index}-${txHash}`,
+        kind: 'payment',
+        hash: txHash,
+        transactionHash: txHash,
+        rawCategory: activity.category || null,
+        category,
+        tokenType: normalizeTokenType(activity.tokenType) || null,
+        asset: extractPaymentAsset(activity),
+        amount: extractPaymentAmount(activity),
+        contractAddress,
         fromAddress: activity.fromAddress || null,
         toAddress: activity.toAddress || null
     };
@@ -543,6 +666,34 @@ function isSupportedNFTActivity(activity) {
     }
 
     return { supported: false, reason: `unsupported_category:${category || 'unknown'}` };
+}
+
+function isSupportedPaymentActivity(activity) {
+    if (!activity) {
+        return { supported: false, reason: 'missing_activity' };
+    }
+
+    const category = normalizeCategory(activity.category);
+    const tokenType = normalizeTokenType(activity.tokenType);
+    const nftSupport = isSupportedNFTActivity(activity);
+
+    if (nftSupport.supported) {
+        return { supported: false, reason: 'nft_activity_not_payment' };
+    }
+
+    if (PAYMENT_CATEGORIES.has(category) || PAYMENT_TOKEN_TYPES.has(tokenType)) {
+        return { supported: true, reason: 'accepted_payment_activity' };
+    }
+
+    if (category === 'token' && PAYMENT_TOKEN_TYPES.has(tokenType)) {
+        return { supported: true, reason: 'accepted_token_payment_activity' };
+    }
+
+    return { supported: false, reason: `unsupported_payment_category:${category || 'unknown'}` };
+}
+
+function getActivityTxHash(activity) {
+    return activity?.transactionHash || activity?.hash || null;
 }
 
 function extractTokenIds(act) {
@@ -575,6 +726,110 @@ function extractTokenIds(act) {
     }
 
     return [...tokenIdSet];
+}
+
+function extractPaymentAsset(activity) {
+    const category = normalizeCategory(activity?.category);
+    if (category === 'external' || category === 'internal') {
+        return 'ETH';
+    }
+
+    const symbol = activity?.asset || activity?.tokenSymbol || activity?.rawContract?.symbol;
+    if (typeof symbol === 'string' && symbol.trim()) {
+        return symbol.trim();
+    }
+
+    const contractAddress = activity?.rawContract?.address || activity?.contractAddress;
+    if (isValidAddress(contractAddress)) {
+        return `ERC20 ${shortAddress(contractAddress)}`;
+    }
+
+    return 'ERC20';
+}
+
+function extractPaymentAmount(activity) {
+    const directValue = [activity?.value, activity?.amount].find((value) =>
+        value !== undefined && value !== null && String(value).trim() !== ''
+    );
+
+    if (directValue !== undefined) {
+        return trimNumericString(directValue);
+    }
+
+    const rawValue = activity?.rawContract?.value;
+    const decimals = parseRawContractDecimals(activity?.rawContract?.decimal);
+    if (rawValue !== undefined && rawValue !== null && decimals !== null) {
+        const formatted = formatRawUnits(rawValue, decimals);
+        if (formatted) {
+            return formatted;
+        }
+    }
+
+    return null;
+}
+
+function parseRawContractDecimals(rawDecimals) {
+    if (rawDecimals === undefined || rawDecimals === null || rawDecimals === '') {
+        return null;
+    }
+
+    if (typeof rawDecimals === 'number' && Number.isInteger(rawDecimals) && rawDecimals >= 0) {
+        return rawDecimals;
+    }
+
+    const rawString = String(rawDecimals).trim();
+    if (!rawString) {
+        return null;
+    }
+
+    const parsed = rawString.startsWith('0x')
+        ? Number.parseInt(rawString, 16)
+        : Number.parseInt(rawString, 10);
+
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function formatRawUnits(rawValue, decimals) {
+    try {
+        const rawString = String(rawValue).trim();
+        if (!rawString) {
+            return null;
+        }
+
+        const units = rawString.startsWith('0x') ? BigInt(rawString) : BigInt(rawString);
+        const scale = 10n ** BigInt(decimals);
+        const whole = units / scale;
+        const fraction = units % scale;
+
+        if (fraction === 0n) {
+            return whole.toString();
+        }
+
+        const fractionText = fraction.toString().padStart(decimals, '0').replace(/0+$/, '');
+        return `${whole.toString()}.${fractionText.slice(0, 8)}`;
+    } catch {
+        return null;
+    }
+}
+
+function trimNumericString(value) {
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+            return null;
+        }
+        return Number.isInteger(value) ? String(value) : value.toFixed(6).replace(/0+$/, '').replace(/\.$/, '');
+    }
+
+    const text = String(value).trim();
+    if (!text) {
+        return null;
+    }
+
+    if (/^-?\d+\.\d+$/.test(text)) {
+        return text.replace(/0+$/, '').replace(/\.$/, '');
+    }
+
+    return text;
 }
 
 function normalizeCategory(category) {
@@ -625,11 +880,14 @@ function groupByTxHash(activities) {
     return grouped;
 }
 
-function classifyTransaction(txActivities, trackedWallets) {
+function classifyTransaction(txActivities, trackedWallets, paymentActivities = []) {
     let nftCount = 0;
     let hasMint = false;
     let hasTrackedFrom = false;
     let hasTrackedTo = false;
+    const paymentEvidence = collectPaymentEvidence(paymentActivities, trackedWallets);
+    const hasTrackedPaymentOut = paymentEvidence.outgoing.length > 0;
+    const hasTrackedPaymentIn = paymentEvidence.incoming.length > 0;
 
     for (const activity of txActivities) {
         const tokenIds = Array.isArray(activity.tokenIds) ? activity.tokenIds.filter(Boolean) : [];
@@ -653,29 +911,91 @@ function classifyTransaction(txActivities, trackedWallets) {
 
     // Mint takes precedence over trade direction.
     if (hasMint) {
-        return { eventType: 'MINT', rawEventType: 'MINT', nftCount, isSweep: false };
+        return createClassification('MINT', 'MINT', nftCount, false, []);
     }
 
-    if (nftCount > 1) {
-        if (hasTrackedFrom && hasTrackedTo) {
-            return { eventType: 'TRANSFER', rawEventType: 'INTERNAL_TRANSFER', nftCount, isSweep: false };
+    if (hasTrackedFrom && hasTrackedTo) {
+        return createClassification('TRANSFER', 'INTERNAL_TRANSFER', nftCount, false, []);
+    }
+
+    if (hasTrackedTo && !hasTrackedFrom) {
+        if (!hasTrackedPaymentOut) {
+            return createClassification('TRANSFER', 'INCOMING_NO_PAYMENT', nftCount, false, []);
         }
-        if (hasTrackedTo && !hasTrackedFrom) {
-            return { eventType: 'SWEEP_BUY', rawEventType: 'SWEEP_BUY', nftCount, isSweep: true };
+
+        if (nftCount > 1) {
+            return createClassification('SWEEP_BUY', 'SWEEP_BUY', nftCount, true, paymentEvidence.outgoing);
         }
-        if (hasTrackedFrom && !hasTrackedTo) {
-            return { eventType: 'SELL', rawEventType: 'BULK_SELL', nftCount, isSweep: false };
+
+        return createClassification('BUY', 'BUY', nftCount, false, paymentEvidence.outgoing);
+    }
+
+    if (hasTrackedFrom && !hasTrackedTo) {
+        if (!hasTrackedPaymentIn) {
+            return createClassification('TRANSFER', 'OUTGOING_NO_PAYMENT', nftCount, false, []);
+        }
+
+        const rawEventType = nftCount > 1 ? 'BULK_SELL' : 'SELL';
+        return createClassification('SELL', rawEventType, nftCount, false, paymentEvidence.incoming);
+    }
+
+    return createClassification('TRANSFER', 'TRANSFER_FALLBACK', nftCount, false, []);
+}
+
+function collectPaymentEvidence(paymentActivities, trackedWallets) {
+    const incoming = [];
+    const outgoing = [];
+
+    if (!Array.isArray(paymentActivities)) {
+        return { incoming, outgoing };
+    }
+
+    for (const payment of paymentActivities) {
+        if (!hasPositiveOrUnknownPaymentAmount(payment)) {
+            continue;
+        }
+
+        const normalizedFrom = normalizeAddress(payment.fromAddress);
+        const normalizedTo = normalizeAddress(payment.toAddress);
+
+        if (normalizedFrom && trackedWallets.has(normalizedFrom)) {
+            outgoing.push(payment);
+        }
+
+        if (normalizedTo && trackedWallets.has(normalizedTo)) {
+            incoming.push(payment);
         }
     }
 
-    if (hasTrackedTo) {
-        return { eventType: 'BUY', rawEventType: 'BUY', nftCount, isSweep: false };
-    }
-    if (hasTrackedFrom) {
-        return { eventType: 'SELL', rawEventType: 'SELL', nftCount, isSweep: false };
+    return { incoming, outgoing };
+}
+
+function hasPositiveOrUnknownPaymentAmount(payment) {
+    if (!payment || payment.amount === null || payment.amount === undefined || payment.amount === '') {
+        return true;
     }
 
-    return { eventType: 'TRANSFER', rawEventType: 'TRANSFER_FALLBACK', nftCount, isSweep: false };
+    const amountText = String(payment.amount).trim();
+    if (/^0x[0-9a-f]+$/i.test(amountText)) {
+        return BigInt(amountText) > 0n;
+    }
+
+    const parsed = Number.parseFloat(amountText.replace(/,/g, ''));
+    if (!Number.isFinite(parsed)) {
+        return true;
+    }
+
+    return parsed > 0;
+}
+
+function createClassification(eventType, rawEventType, nftCount, isSweep, paymentEvidence) {
+    return {
+        eventType,
+        rawEventType,
+        nftCount,
+        isSweep,
+        paymentEvidence: Array.isArray(paymentEvidence) ? paymentEvidence : []
+    };
 }
 
 function buildEventFromTransaction(txHash, txActivities, classification, trackedWallets) {
@@ -760,7 +1080,8 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
             nftCount: classification.nftCount,
             isSweep: Boolean(classification.isSweep),
             sweepType: eventType === 'SWEEP_BUY' ? 'buy' : 'sell',
-            primaryTrackedWallet
+            primaryTrackedWallet,
+            paymentEvidence: classification.paymentEvidence
         };
     }
 
@@ -816,7 +1137,8 @@ function buildEventFromTransaction(txHash, txActivities, classification, tracked
         isBulk: isBulkSell,
         isSweep: Boolean(classification.isSweep),
         sweepType: null,
-        primaryTrackedWallet
+        primaryTrackedWallet,
+        paymentEvidence: classification.paymentEvidence
     };
 }
 
@@ -840,49 +1162,82 @@ function collectTokenIdsFromActivities(txActivities) {
 }
 
 async function buildEmbed(event, guildLabels) {
-    const typeLabel = event.type.toUpperCase();
+    const presentation = getEventPresentation(event);
+    const paymentSummary = formatPaymentSummary(event.paymentEvidence);
+    const fields = [];
 
     const embed = new EmbedBuilder()
-        .setColor(0x627EEA)
-        .setTitle(`🚨 ${typeLabel} NFT Ethereum Terdeteksi!`)
+        .setColor(presentation.color)
+        .setTitle(presentation.title)
         .setTimestamp()
-        .setFooter({ text: 'Trace NFT Watcher • Powered by Alchemy' });
+        .setFooter({ text: buildFooterText(event) });
 
     if (event.type === 'sweep') {
-        const contractValue = await formatSweepContracts(event.contracts);
-        embed.addFields(
-            { name: 'Koleksi (Contract)', value: contractValue, inline: false },
-            { name: 'Tipe', value: typeLabel, inline: true },
+        fields.push(
+            { name: 'Koleksi', value: await formatSweepContracts(event.contracts), inline: false },
+            { name: 'Signal', value: presentation.label, inline: true },
             { name: 'Jumlah NFT', value: String(event.nftCount), inline: true },
-            { name: 'Token Ringkasan', value: formatTokenSummary(event.tokenIds), inline: false },
+            { name: 'Token', value: formatTokenSummary(event.tokenIds), inline: false },
             { name: 'Dari', value: formatSweepFrom(event.fromAddresses, guildLabels), inline: true },
-            { name: 'Ke (Target)', value: formatWallet(event.toAddress, guildLabels), inline: true }
+            { name: 'Ke Target', value: formatWallet(event.toAddress, guildLabels), inline: true }
         );
-        return embed;
-    }
+    } else {
+        const isMultiToken = event.isBulk || Number(event.nftCount) > 1;
+        fields.push(
+            { name: 'Koleksi', value: await formatContract(event.contractAddress), inline: false },
+            { name: 'Signal', value: presentation.label, inline: true },
+            {
+                name: isMultiToken ? 'Jumlah NFT' : 'Token ID',
+                value: isMultiToken ? String(event.nftCount) : escapeMarkdown(event.tokenId || 'N/A'),
+                inline: true
+            }
+        );
 
-    const contractValue = await formatContract(event.contractAddress);
-    if (event.type === 'sell' && event.isBulk) {
-        embed.addFields(
-            { name: 'Koleksi (Contract)', value: contractValue, inline: false },
-            { name: 'Tipe', value: typeLabel, inline: true },
-            { name: 'Jumlah NFT', value: String(event.nftCount), inline: true },
-            { name: 'Token Ringkasan', value: formatTokenSummary(event.tokenIds), inline: false },
+        if (isMultiToken) {
+            fields.push({ name: 'Token', value: formatTokenSummary(event.tokenIds), inline: false });
+        }
+
+        fields.push(
             { name: 'Dari', value: formatWallet(event.fromAddress, guildLabels), inline: true },
-            { name: 'Ke (Target)', value: formatWallet(event.toAddress, guildLabels), inline: true }
+            { name: 'Ke Target', value: formatWallet(event.toAddress, guildLabels), inline: true }
         );
-        return embed;
     }
 
-    embed.addFields(
-        { name: 'Koleksi (Contract)', value: contractValue, inline: false },
-        { name: 'Tipe', value: typeLabel, inline: true },
-        { name: 'Token ID', value: escapeMarkdown(event.tokenId || 'N/A'), inline: true },
-        { name: 'Dari', value: formatWallet(event.fromAddress, guildLabels), inline: true },
-        { name: 'Ke (Target)', value: formatWallet(event.toAddress, guildLabels), inline: true }
-    );
+    if (paymentSummary) {
+        fields.push({ name: 'Pembayaran', value: paymentSummary, inline: false });
+    }
 
+    fields.push({ name: 'Links', value: formatTxLinks(event), inline: false });
+    embed.addFields(fields);
     return embed;
+}
+
+function getEventPresentation(event) {
+    const presentations = {
+        mint: { color: 0x9B59B6, label: 'MINT', title: 'MINT NFT Ethereum' },
+        buy: { color: 0x2ECC71, label: 'BUY', title: 'BUY NFT Ethereum' },
+        sell: { color: 0xF1C40F, label: event.isBulk ? 'BULK SELL' : 'SELL', title: event.isBulk ? 'BULK SELL NFT Ethereum' : 'SELL NFT Ethereum' },
+        sweep: { color: 0x1ABC9C, label: 'SWEEP BUY', title: 'SWEEP BUY NFT Ethereum' },
+        transfer: { color: 0x95A5A6, label: 'TRANSFER', title: 'TRANSFER NFT Ethereum' }
+    };
+
+    return presentations[event.type] || {
+        color: 0x627EEA,
+        label: String(event.type || 'UNKNOWN').toUpperCase(),
+        title: 'NFT Ethereum Activity'
+    };
+}
+
+function buildFooterText(event) {
+    const base = 'Trace NFT Watcher • Powered by Alchemy';
+    const rawEventType = event.rawEventType;
+    const mappedEventType = event.type === 'sweep' ? 'SWEEP_BUY' : String(event.type || '').toUpperCase();
+
+    if (rawEventType && rawEventType !== mappedEventType) {
+        return `${base} • ${rawEventType}`;
+    }
+
+    return base;
 }
 
 function formatSweepFrom(fromAddresses, guildLabels) {
@@ -928,6 +1283,58 @@ function formatTokenSummary(tokenIds) {
     }
 
     return `${preview} +${sanitized.length - MAX_SWEEP_TOKEN_PREVIEW} lainnya`;
+}
+
+function formatPaymentSummary(paymentEvidence) {
+    if (!Array.isArray(paymentEvidence) || paymentEvidence.length === 0) {
+        return null;
+    }
+
+    const formatted = paymentEvidence
+        .map((payment) => {
+            const amount = payment.amount ? `${escapeMarkdown(payment.amount)} ` : '';
+            const asset = escapeMarkdown(payment.asset || 'Payment');
+            const from = formatPaymentAddress(payment.fromAddress);
+            const to = formatPaymentAddress(payment.toAddress);
+            return `${amount}${asset} (${from} -> ${to})`;
+        })
+        .filter(Boolean);
+
+    if (formatted.length === 0) {
+        return null;
+    }
+
+    const preview = formatted.slice(0, 3).join('\n');
+    const extra = formatted.length > 3 ? `\n+${formatted.length - 3} payment lainnya` : '';
+
+    return `${preview}${extra}`;
+}
+
+function formatPaymentAddress(address) {
+    if (!address) {
+        return 'N/A';
+    }
+
+    if (!isValidAddress(address)) {
+        return escapeMarkdown(address);
+    }
+
+    return shortAddress(address);
+}
+
+function formatTxLinks(event) {
+    const links = [];
+
+    if (event.hash) {
+        links.push(`[Etherscan Tx](${ETHERSCAN_TX_URL}/${event.hash})`);
+    }
+
+    const assetUrl = getOpenSeaAssetUrl(event.contractAddress, event.tokenId);
+    if (assetUrl) {
+        links.push(`[OpenSea Asset](${assetUrl})`);
+    }
+
+    return links.length > 0 ? links.join(' • ') : 'N/A';
 }
 
 async function formatContract(contractAddress) {
@@ -1044,8 +1451,16 @@ function extractOpenSeaCollectionSlug(payload) {
     return null;
 }
 
-function getOpenSeaAssetUrl(contractAddress) {
-    return `${OPENSEA_ASSET_URL}/${contractAddress}`;
+function getOpenSeaAssetUrl(contractAddress, tokenId = null) {
+    if (!contractAddress) {
+        return null;
+    }
+
+    if (!tokenId || tokenId === 'N/A') {
+        return `${OPENSEA_ASSET_URL}/${contractAddress}`;
+    }
+
+    return `${OPENSEA_ASSET_URL}/${contractAddress}/${encodeURIComponent(tokenId)}`;
 }
 
 function logOpenSeaLookupDebug(message) {
@@ -1114,3 +1529,23 @@ async function registerGuildCommands() {
 
     console.log(`✅ Slash command wallet-label terdaftar untuk guild ${guildId}`);
 }
+
+if (require.main === module) {
+    startBot();
+}
+
+module.exports = {
+    ZERO_ADDRESS,
+    classifyTransaction,
+    collectPaymentEvidence,
+    buildEventFromTransaction,
+    normalizeActivity,
+    normalizePaymentActivity,
+    isSupportedNFTActivity,
+    isSupportedPaymentActivity,
+    formatPaymentSummary,
+    getOpenSeaAssetUrl,
+    parseAddressList,
+    normalizeAddress,
+    startBot
+};

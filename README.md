@@ -70,6 +70,8 @@ When the bot is online and `DISCORD_CLIENT_ID` + `GUILD_ID` are valid, slash com
 | `PORT` | No | HTTP server port for webhook receiver | `3000` |
 | `WEBHOOK_BODY_LIMIT` | No | Max JSON payload size for `/webhook/nft` | `20mb` |
 | `WEBHOOK_DEBUG_SKIPS` | No | Enable debug logs for skipped/filtered webhook activities | `false` |
+| `TX_CONTEXT_DEBOUNCE_MS` | No | Wait window for merging NFT + payment fragments from the same tx | `2000` |
+| `TX_CONTEXT_TTL_MS` | No | Max time to keep incomplete tx context in memory | `120000` |
 | `OPENSEA_API_KEY` | No | OpenSea API key for contract -> collection slug lookup | `os_...` |
 | `OPENSEA_LOOKUP_TIMEOUT_MS` | No | Timeout for OpenSea lookup requests in ms | `2500` |
 | `OPENSEA_SLUG_CACHE_TTL_SECONDS` | No | Cache TTL for resolved contract links | `86400` |
@@ -80,8 +82,9 @@ Notes:
 - `TRACKED_WALLETS` is optional but recommended in production so BUY/SELL classification is consistent.
 - Invalid or empty filter values fall back to default: `mint,sweep,buy,sell,transfer`.
 - For Alchemy `Address Activity`, payload `category: token` is treated as NFT only when NFT evidence exists (`erc721TokenId`, `erc1155Metadata`, or `tokenType` = `ERC721/ERC1155`).
-- Ambiguous NFT direction (cannot infer BUY/SELL safely) is mapped to `TRANSFER` instead of being dropped.
-- Bulk sell from tracked wallet (`nftCount > 1` and wallet on `from`) is classified as `SELL`, not `SWEEP`.
+- Ambiguous NFT direction or NFT movement without same-transaction payment evidence is mapped to `TRANSFER` instead of being forced into `BUY`/`SELL`.
+- BUY/SWEEP requires payment out from a tracked wallet in the same transaction context; SELL requires payment in to a tracked wallet.
+- Bulk sell from tracked wallet (`nftCount > 1`, wallet on `from`, and payment in to tracked wallet) is classified as `SELL`, not `SWEEP`.
 - Set `WEBHOOK_DEBUG_SKIPS=true` temporarily for detailed skip reasons (`reason`, `category`, `tokenType`, `txHash`).
 - Contract links (`Koleksi (Contract)`) use OpenSea collection URL (`/collection/{slug}`), then fallback to OpenSea asset URL (`/assets/ethereum/{contract}`) when slug lookup fails.
 - Wallet links (`Dari`/`Ke`) remain Etherscan links.
@@ -121,7 +124,8 @@ Behavior summary:
 - Non-NFT activities are ignored.
 - Non-NFT or unsupported payload patterns are skipped.
 - Events not included in `TX_EVENT_FILTERS` are not sent.
-- Bulk sell transactions from tracked wallets are emitted as `SELL` (with token summary), not `SWEEP`.
+- The webhook keeps a short in-memory transaction context so NFT and ETH/ERC20 payment fragments from Alchemy can be merged before classification.
+- Bulk sell transactions from tracked wallets with payment evidence are emitted as `SELL` (with token summary), not `SWEEP`.
 
 ## Deployment (PM2)
 
